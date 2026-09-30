@@ -52,7 +52,7 @@ async function submitStrategy(reset = false) {
   })
   strategySaving.value = false
   if (r.ok) {
-    strategyMsg.value = `策略已发布，并按新策略重算 ${r.recalced} 个候选人的推荐结果`
+    strategyMsg.value = `策略 ${r.strategy?.versionId ? 'v' + r.strategy.versionId : 'v0'} 已发布，批次 #${r.job_id || '-'} 已重算 ${r.recalced} 个候选人`
     setTimeout(() => { strategyOpen.value = false }, 900)
   } else {
     strategyMsg.value = '发布失败，请重试'
@@ -114,7 +114,7 @@ function submit() {
         </div>
         <div class="stline">
           <span class="st-tag" :class="{ custom: !!p.strategy }">
-            {{ p.strategy ? '⚙️ 已配置匹配策略' : '⚙️ 默认匹配策略' }}
+            {{ p.strategy ? `⚙️ 定制策略 ${lastVersionOf(p.id) ? `v${lastVersionOf(p.id).id}` : ''}` : '⚙️ 默认匹配策略 v0' }}
           </span>
           <span class="muted st-w" v-if="lastVersionOf(p.id)">
             技{{ Math.round(lastVersionOf(p.id).weights.skill * 100) }}% · 薪{{ Math.round(lastVersionOf(p.id).weights.salary * 100) }}% · 词+{{ lastVersionOf(p.id).keyword_cap }}

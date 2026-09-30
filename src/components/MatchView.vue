@@ -20,7 +20,7 @@ async function recomputeAll() {
   const r = await store.recomputeAll()
   recomputing.value = false
   if (r?.ok) {
-    recomputeMsg.value = `已按各职位最新策略重算 ${r.positions} 个职位共 ${r.pairs} 组匹配`
+    recomputeMsg.value = `批次 #${r.job_id || '-'} 已按各职位最新策略重算 ${r.positions} 个职位共 ${r.pairs} 组匹配`
     if (result.value) runMatch()
     setTimeout(() => { recomputeMsg.value = '' }, 4000)
   }
@@ -92,7 +92,8 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
           <h3>{{ result.position.name }} <span class="tag">{{ result.position.dept }} · {{ result.position.city }}</span></h3>
           <div class="muted">薪资 ¥{{ result.position.salary_min }}K-{{ result.position.salary_max }}K · 经验 {{ result.position.years }}年+</div>
           <div class="st-badge" :class="{ custom: result.strategy && !result.strategy.isDefault }" :title="strategyTitle(result.strategy)">
-            ⚙️ {{ result.strategy?.isDefault === false ? '职位定制策略' : '默认匹配策略' }}：
+            ⚙️ {{ result.strategy?.isDefault === false ? '职位定制策略' : '默认匹配策略' }}
+            <b class="ver-id">{{ result.strategy?.versionId ? `v${result.strategy.versionId}` : 'v0' }}</b>：
             技{{ Math.round((result.strategy?.weights.skill ?? 0.4) * 100) }}% ·
             年限{{ Math.round((result.strategy?.weights.year ?? 0.2) * 100) }}% ·
             薪{{ Math.round((result.strategy?.weights.salary ?? 0.15) * 100) }}% ·
@@ -179,6 +180,7 @@ const topN = computed(() => (result.value?.candidates || result.value?.positions
 .recalc-msg { font-style: normal; font-size: 12px; color: var(--green); }
 .st-badge { margin-top: 6px; font-size: 11px; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 3px 8px; display: inline-block; }
 .st-badge.custom { color: var(--purple); border-color: rgba(167,139,250,.4); background: rgba(167,139,250,.1); }
+.ver-id { color: var(--accent2); margin: 0 2px; font-style: normal; }
 .result-head { display: flex; align-items: center; gap: 20px; justify-content: space-between; flex-wrap: wrap; }
 .h-metric { text-align: center; }
 .h-metric b { font-size: 30px; color: var(--accent); display: block; }

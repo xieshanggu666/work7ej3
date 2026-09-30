@@ -10,6 +10,19 @@ const parseSkills = s => { try { return JSON.parse(s || '[]') } catch { return [
 const parseJSON = (s, d) => { try { return JSON.parse(s || '') ?? d } catch { return d } }
 const parseDims = (s, d) => parseJSON(s, parseJSON(d, []))
 
+// Node:sqlite 同步执行；所有“多步业务动作”放进一个事务，保证策略发布/重算/流程推进不会交叉出半条链路
+function tx(fn) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const result = fn()
+    db.exec('COMMIT')
+    return result
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+}
+
 const STAGES = ['submitted', 'screening', 'interview', 'offer', 'hired']
 const NEXT_STAGE = { submitted: 'screening', screening: 'interview', interview: 'offer', offer: 'hired' }
 
@@ -38,16 +51,29 @@ function normalizeWeights(input) {
 function getStrategy(posId) {
   const row = db.prepare('SELECT * FROM match_strategies WHERE position_id=?').get(num(posId))
   if (!row) {
-    return { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP, versionId: 0, publishedAt: '', isDefault: true }
+    return { positionId: num(posId), weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP, versionId: 0, publishedAt: '', publishedBy: '', isDefault: true }
   }
   const ver = db.prepare('SELECT id FROM strategy_versions WHERE position_id=? ORDER BY id DESC LIMIT 1').get(row.position_id)
   return {
+    positionId: row.position_id,
     weights: normalizeWeights(parseJSON(row.weights, { ...DEFAULT_WEIGHTS })),
     keywordCap: Math.max(0, num(row.keyword_cap, DEFAULT_KEYWORD_CAP)),
     versionId: ver ? ver.id : 0,
     publishedAt: row.published_at,
     publishedBy: row.published_by,
     isDefault: false
+  }
+}
+
+function getStrategyVersion(versionId) {
+  const id = num(versionId)
+  if (!id) return null
+  const v = db.prepare('SELECT * FROM strategy_versions WHERE id=?').get(id)
+  if (!v) return null
+  return {
+    ...v,
+    keyword_cap: num(v.keyword_cap),
+    weights: normalizeWeights(parseJSON(v.weights, { ...DEFAULT_WEIGHTS }))
   }
 }
 
@@ -132,38 +158,70 @@ function computeMatch(cand, pos, strategy) {
   return { score, dims, reason, weakness: weakness.join('、') || '无显著短板' }
 }
 
-// 按职位当前已发布策略重算并落库为「最新结果」（不影响 applications 里的投递快照）
-function upsertMatch(candId, posId) {
+// 计算评分但不落库：推荐列表浏览不隐式制造“最新结果”，避免与流程推进时看到的证据不一致
+function computePair(candId, posId, strategy = getStrategy(posId)) {
   const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(candId)
   const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(posId)
   if (!cand || !pos) return null
-  const strategy = getStrategy(posId)
   const m = computeMatch(cand, pos, strategy)
-  const stamp = now()
-  const existing = db.prepare('SELECT id FROM matches WHERE candidate_id=? AND position_id=?').get(candId, posId)
-  if (existing) {
-    db.prepare('UPDATE matches SET score=?,dims=?,reason=?,weakness=?,computed_at=?,strategy_id=? WHERE id=?')
-      .run(m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, strategy.versionId, existing.id)
-  } else {
-    db.prepare('INSERT INTO matches(candidate_id,position_id,score,dims,reason,weakness,computed_at,strategy_id) VALUES(?,?,?,?,?,?,?,?)')
-      .run(candId, posId, m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, strategy.versionId)
-  }
   return {
-    ...m, candidate_id: candId, position_id: posId,
-    weights: strategy.weights, keyword_cap: strategy.keywordCap,
-    strategy_id: strategy.versionId, strategy_is_default: strategy.isDefault,
-    computed_at: stamp
+    ...m,
+    candidate_id: candId,
+    position_id: posId,
+    weights: strategy.weights,
+    keyword_cap: strategy.keywordCap,
+    strategy_id: strategy.versionId,
+    strategy_is_default: strategy.isDefault,
+    computed_at: now()
   }
 }
 
-// 投递时的评分依据快照：锁定分数/维度/理由/短板及所用策略，后续重算不再改变
-function buildSnapshot(candId, posId, m) {
+function createRecalcJob({ triggerType, scope, positionId = 0, strategyId = 0, triggeredBy = 'HR' }) {
+  const stamp = ts()
+  const r = db.prepare(`INSERT INTO recalc_jobs(trigger_type,scope,position_id,strategy_id,status,pair_count,started_at,finished_at,triggered_by)
+                        VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run(triggerType, scope, num(positionId), num(strategyId), 'running', 0, stamp, stamp, triggeredBy)
+  return Number(r.lastInsertRowid)
+}
+
+function completeRecalcJob(jobId, pairCount) {
+  db.prepare('UPDATE recalc_jobs SET status=?, pair_count=?, finished_at=? WHERE id=?')
+    .run('completed', pairCount, ts(), jobId)
+}
+
+// 按职位当前已发布策略重算并落库为「最新结果」（不影响 applications/events 中的历史快照）
+function upsertMatch(candId, posId, jobId = 0) {
+  const m = computePair(candId, posId)
+  if (!m) return null
+  const stamp = m.computed_at
+  const jid = num(jobId)
+  const existing = db.prepare('SELECT id FROM matches WHERE candidate_id=? AND position_id=?').get(candId, posId)
+  if (existing) {
+    db.prepare('UPDATE matches SET score=?,dims=?,reason=?,weakness=?,computed_at=?,strategy_id=? WHERE id=?')
+      .run(m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, m.strategy_id, existing.id)
+  } else {
+    db.prepare('INSERT INTO matches(candidate_id,position_id,score,dims,reason,weakness,computed_at,strategy_id) VALUES(?,?,?,?,?,?,?,?)')
+      .run(candId, posId, m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp, m.strategy_id)
+  }
+  if (jid) {
+    db.prepare(`INSERT INTO recalc_items(job_id,candidate_id,position_id,strategy_id,score,dims,reason,weakness,computed_at)
+                VALUES(?,?,?,?,?,?,?,?,?)`)
+      .run(jid, candId, posId, m.strategy_id, m.score, JSON.stringify(m.dims), m.reason, m.weakness, stamp)
+  }
+  return { ...m, recalc_job_id: jid }
+}
+
+// 投递/进入阶段时的评分依据快照：锁定分数、维度、理由、短板及所用策略版本，后续重算不再改变
+function buildSnapshot(candId, posId, m, extra = {}) {
   const strategy = getStrategy(posId)
   return {
     score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness,
     weights: strategy.weights, keyword_cap: strategy.keywordCap,
     strategy_id: strategy.versionId, strategy_is_default: strategy.isDefault,
-    matched_at: now()
+    published_at: strategy.publishedAt, published_by: strategy.publishedBy,
+    candidate_id: candId, position_id: posId,
+    matched_at: now(),
+    ...extra
   }
 }
 
@@ -181,12 +239,33 @@ app.get('/api/state', (req, res) => {
   const strategyVersions = db.prepare('SELECT * FROM strategy_versions ORDER BY id DESC').all().map(v => ({
     ...v, weights: parseJSON(v.weights, { ...DEFAULT_WEIGHTS }), keyword_cap: num(v.keyword_cap)
   }))
+  const recalcJobs = db.prepare('SELECT * FROM recalc_jobs ORDER BY id DESC').all().map(j => ({
+    ...j,
+    position_id: num(j.position_id),
+    strategy_id: num(j.strategy_id),
+    pair_count: num(j.pair_count)
+  }))
+  const recalcItems = db.prepare('SELECT id,job_id,candidate_id,position_id,strategy_id,score,computed_at FROM recalc_items ORDER BY id DESC LIMIT 500')
+    .all().map(i => ({ ...i, strategy_id: num(i.strategy_id), score: num(i.score) }))
+  const appEvents = db.prepare('SELECT * FROM application_events ORDER BY id ASC').all().map(e => ({
+    ...e,
+    from_stage: e.from_stage || '',
+    match_score: num(e.match_score),
+    strategy_id: num(e.strategy_id),
+    recalc_job_id: num(e.recalc_job_id),
+    backfilled: !!e.backfilled,
+    stage_label: { submitted: '投递', screening: '筛选', interview: '面试', offer: 'Offer', hired: '录用', rejected: '淘汰' }[e.stage] || e.stage,
+    scoreSnapshot: parseJSON(e.score_snapshot, null)
+  }))
+  const jobOf = new Map(recalcJobs.map(j => [j.id, j]))
   const matches = db.prepare('SELECT * FROM matches ORDER BY id DESC').all().map(m => ({
     ...m,
     score: num(m.score),
     dims: parseDims(m.dims, '[]'),
     strategy_id: num(m.strategy_id)
   }))
+  const latestItemOf = (cid, pid) => db.prepare(`SELECT ri.* FROM recalc_items ri
+    WHERE ri.candidate_id=? AND ri.position_id=? ORDER BY ri.id DESC LIMIT 1`).get(cid, pid) || null
   const matchOf = (cid, pid) => matches.find(m => m.candidate_id === cid && m.position_id === pid) || null
   const pipelines = apps.map(a => {
     const pos = positions.find(p => p.id === a.position_id)
@@ -194,11 +273,16 @@ app.get('/api/state', (req, res) => {
     const its = interviews.filter(i => i.application_id === a.id)
     const of = offers.find(o => o.application_id === a.id) || null
     const mt = matchOf(a.candidate_id, a.position_id)
+    const latestItem = latestItemOf(a.candidate_id, a.position_id)
+    const latestJob = latestItem ? (jobOf.get(latestItem.job_id) || null) : null
     // 投递时锁定的历史评分依据；兼容旧数据：无快照时置空由前端回退最新分
     const snap = parseJSON(a.match_snapshot, null)
     const latest = mt ? {
       score: mt.score, dims: mt.dims, reason: mt.reason, weakness: mt.weakness,
-      computed_at: mt.computed_at, strategy_id: mt.strategy_id
+      computed_at: mt.computed_at, strategy_id: mt.strategy_id,
+      recalc_job_id: latestItem?.job_id || 0,
+      recalc_trigger: latestJob?.trigger_type || '',
+      recalc_scope: latestJob?.scope || ''
     } : null
     return {
       ...a,
@@ -206,12 +290,13 @@ app.get('/api/state', (req, res) => {
       candidate: cand ? cand.name : '', candSkills: cand ? cand.skills : [],
       matchSnapshot: snap, matched_at: a.matched_at || '',
       match: latest,
+      events: appEvents.filter(e => e.application_id === a.id),
       interviews: its, offer: of
     }
   })
   res.json({
     positions, candidates, applications: pipelines, interviews, offers, channels, matches,
-    strategyVersions,
+    strategyVersions, recalcJobs, recalcItems,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP }
   })
 })
@@ -264,45 +349,75 @@ app.post('/api/positions/:id/strategy', (req, res) => {
     weights = normalizeWeights(b.weights || {})
     keywordCap = Math.max(0, Math.min(20, num(b.keyword_cap, DEFAULT_KEYWORD_CAP)))
   }
-  const vr = db.prepare('INSERT INTO strategy_versions(position_id,weights,keyword_cap,published_at,published_by) VALUES(?,?,?,?,?)')
-    .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
-  const versionId = Number(vr.lastInsertRowid)
-  db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,published_at,published_by)
-              VALUES(?,?,?,?,?)
-              ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,published_at=excluded.published_at,published_by=excluded.published_by`)
-    .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
-  // 发布后按新策略批量重算该职位的全部推荐结果（默认开启）
-  let recalced = 0
-  if (b.recalc !== false) recalced = recomputePosition(id)
-  res.json({ ok: true, strategy: { weights, keywordCap, versionId, publishedAt: stamp }, recalced })
+
+  const result = tx(() => {
+    const vr = db.prepare('INSERT INTO strategy_versions(position_id,weights,keyword_cap,published_at,published_by) VALUES(?,?,?,?,?)')
+      .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
+    const versionId = Number(vr.lastInsertRowid)
+    db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,published_at,published_by)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,published_at=excluded.published_at,published_by=excluded.published_by`)
+      .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
+
+    // 发布与重算在同一事务：版本、生效策略、最新分和批次明细要么同时可见，要么全部回滚
+    let jobId = 0, pairCount = 0
+    if (b.recalc !== false) {
+      jobId = createRecalcJob({ triggerType: 'strategy_publish', scope: 'position', positionId: id, strategyId: versionId, triggeredBy: b.published_by || 'HR' })
+      pairCount = recomputePosition(id, jobId)
+      completeRecalcJob(jobId, pairCount)
+    }
+    return { weights, keywordCap, versionId, jobId, pairCount }
+  })
+  res.json({
+    ok: true,
+    strategy: { weights, keywordCap, versionId: result.versionId, publishedAt: stamp },
+    job_id: result.jobId,
+    recalced: result.pairCount
+  })
 })
 
 // ---------------- 批量重算推荐结果 ----------------
 // 单职位：全部候选人 × 该职位（含未投递候选人，保证推荐列表可用）
-function recomputePosition(posId) {
+function recomputePosition(posId, jobId = 0) {
   const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(posId)
   if (!pos) return 0
   const cands = db.prepare('SELECT id FROM candidates').all()
-  cands.forEach(c => upsertMatch(c.id, posId))
+  cands.forEach(c => upsertMatch(c.id, posId, jobId))
   return cands.length
 }
 
 app.post('/api/match/recompute', (req, res) => {
   const b = req.body || {}
-  let pairCount = 0, posCount = 0
-  if (b.position_id) {
-    const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(num(b.position_id))
-    if (!pos) return res.status(404).json({ ok: false })
-    pairCount = recomputePosition(num(b.position_id))
-    posCount = 1
-  } else {
+  const result = tx(() => {
+    let pairCount = 0, posCount = 0, scope = 'global', targetPos = 0, strategyId = 0
+    if (b.position_id) {
+      const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(num(b.position_id))
+      if (!pos) return { notFound: true }
+      targetPos = pos.id
+      scope = 'position'
+      strategyId = getStrategy(pos.id).versionId
+      const jobId = createRecalcJob({ triggerType: 'manual', scope, positionId: targetPos, strategyId, triggeredBy: b.triggered_by || 'HR' })
+      pairCount = recomputePosition(targetPos, jobId)
+      posCount = 1
+      completeRecalcJob(jobId, pairCount)
+      return { ok: true, jobId, positions: posCount, pairs: pairCount }
+    }
+
+    const jobId = createRecalcJob({ triggerType: 'manual', scope, triggeredBy: b.triggered_by || 'HR' })
     // 全局：所有在招职位 × 全部候选人；同时补上已关闭职位上已存在的匹配对
-    const open = db.prepare("SELECT id FROM positions WHERE status='open'").all()
-    open.forEach(p => { pairCount += recomputePosition(p.id); posCount++ })
+    const posIds = db.prepare("SELECT id FROM positions WHERE status='open'").all().map(p => p.id)
     db.prepare("SELECT DISTINCT m.position_id FROM matches m JOIN positions p ON p.id=m.position_id WHERE p.status!='open'")
-      .all().forEach(r => { pairCount += recomputePosition(r.position_id); posCount++ })
-  }
-  res.json({ ok: true, positions: posCount, pairs: pairCount, recomputed_at: ts() })
+      .all().forEach(r => posIds.push(r.position_id))
+    posIds.forEach(pid => {
+      // 批次是全局操作，明细保留每个职位实际使用的策略版本，职位级批次元数据记录在批次明细中可查
+      pairCount += recomputePosition(pid, jobId)
+      posCount++
+    })
+    completeRecalcJob(jobId, pairCount)
+    return { ok: true, jobId, positions: posCount, pairs: pairCount }
+  })
+  if (result.notFound) return res.status(404).json({ ok: false })
+  res.json({ ok: true, positions: result.positions, pairs: result.pairs, job_id: result.jobId, recomputed_at: ts() })
 })
 
 // ---------------- 候选人 ----------------
@@ -325,9 +440,9 @@ app.get('/api/match/pos/:pid', (req, res) => {
   if (!pos) return res.status(404).json({ ok: false })
   const cands = db.prepare('SELECT * FROM candidates').all()
   const rows = cands.map(c => {
-    // 每次匹配都按职位当前策略重算并落库，保证推荐结果与已落库的最新结果一致
-    const m = upsertMatch(c.id, posId)
-    return { candidate_id: c.id, name: c.name, skills: parseSkills(c.skills), years: c.years, edu: c.edu, city: c.city, exp_salary: c.exp_salary, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at }
+    // 浏览推荐时实时计算；只有显式“批量重算/发布策略”才更新最新结果与审计批次
+    const m = computePair(c.id, posId)
+    return { candidate_id: c.id, name: c.name, skills: parseSkills(c.skills), years: c.years, edu: c.edu, city: c.city, exp_salary: c.exp_salary, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_id: m.strategy_id }
   })
   rows.sort((a, b) => b.score - a.score)
   const strategy = getStrategy(posId)
@@ -340,15 +455,67 @@ app.get('/api/match/cand/:cid', (req, res) => {
   if (!cand) return res.status(404).json({ ok: false })
   const poss = db.prepare("SELECT * FROM positions WHERE status='open'").all()
   const rows = poss.map(p => {
-    // 与按职位推荐共用同一落库逻辑，保证分数/理由/短板完全一致
-    const m = upsertMatch(candId, p.id)
-    return { position_id: p.id, name: p.name, dept: p.dept, city: p.city, level: p.level, salary_min: p.salary_min, salary_max: p.salary_max, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_is_default: m.strategy_is_default }
+    // 与按职位推荐共用同一实时计算逻辑；显式重算的结果才写入最新结果/批次明细
+    const m = computePair(candId, p.id)
+    return { position_id: p.id, name: p.name, dept: p.dept, city: p.city, level: p.level, salary_min: p.salary_min, salary_max: p.salary_max, score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness, computed_at: m.computed_at, strategy_id: m.strategy_id, strategy_is_default: m.strategy_is_default }
   })
   rows.sort((a, b) => b.score - a.score)
   res.json({ candidate: { name: cand.name, skills: parseSkills(cand.skills), years: cand.years }, positions: rows })
 })
 
 // ---------------- 应聘流程 ----------------
+function getStoredMatch(candId, posId) {
+  return db.prepare('SELECT * FROM matches WHERE candidate_id=? AND position_id=?').get(candId, posId) || null
+}
+
+function resultFromStored(row) {
+  if (!row) return null
+  return {
+    score: num(row.score),
+    dims: parseDims(row.dims, '[]'),
+    reason: row.reason,
+    weakness: row.weakness,
+    computed_at: row.computed_at,
+    strategy_id: num(row.strategy_id)
+  }
+}
+
+function latestJobForPair(candId, posId) {
+  return db.prepare(`SELECT ri.job_id, ri.strategy_id, ri.computed_at
+                     FROM recalc_items ri
+                     WHERE ri.candidate_id=? AND ri.position_id=?
+                     ORDER BY ri.id DESC LIMIT 1`).get(candId, posId) || null
+}
+
+function insertStageEvent({ applicationId, stage, fromStage, eventType = 'advance', operator = 'HR-Sandy', candId, posId, latest, backfilled = false }) {
+  const source = latest || resultFromStored(getStoredMatch(candId, posId))
+  const item = latestJobForPair(candId, posId)
+  const linkedItem = source && item && item.computed_at === source.computed_at ? item : null
+  const recalcJobId = latest && Object.prototype.hasOwnProperty.call(latest, 'recalc_job_id')
+    ? num(latest.recalc_job_id)
+    : num(linkedItem?.job_id || 0)
+  const stamp = ts()
+  const snap = buildSnapshot(candId, posId, source || {
+    score: 0, dims: [], reason: '暂无已发布评分', weakness: '暂无评分依据'
+  }, {
+    stage,
+    stage_label: stage,
+    event_type: eventType,
+    event_at: stamp,
+    recalc_job_id: recalcJobId,
+    backfilled
+  })
+  db.prepare(`INSERT INTO application_events(application_id,stage,from_stage,event_type,event_at,operator,score_snapshot,match_score,strategy_id,recalc_job_id,backfilled)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(application_id,stage,event_type) DO UPDATE SET
+                from_stage=excluded.from_stage,event_at=excluded.event_at,operator=excluded.operator,
+                score_snapshot=excluded.score_snapshot,match_score=excluded.match_score,
+                strategy_id=excluded.strategy_id,recalc_job_id=excluded.recalc_job_id,backfilled=excluded.backfilled`)
+    .run(applicationId, stage, fromStage || '', eventType, stamp, operator,
+      JSON.stringify(snap), snap.score, snap.strategy_id, snap.recalc_job_id, backfilled ? 1 : 0)
+  return snap
+}
+
 app.post('/api/applications', (req, res) => {
   const b = req.body || {}
   const pid = num(b.position_id), cid = num(b.candidate_id)
@@ -357,28 +524,66 @@ app.post('/api/applications', (req, res) => {
   const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(cid)
   const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(pid)
   if (!cand || !pos) return res.status(404).json({ ok: false, msg: '职位或候选人不存在' })
-  // 先按职位策略重算最新结果，再把当前评分依据固化为投递快照（历史评分不再随后续重算改变）
-  const m = upsertMatch(cid, pid)
-  const snap = buildSnapshot(cid, pid, m)
-  const r = db.prepare('INSERT INTO applications(position_id,candidate_id,stage,updated,recruiter,match_snapshot,matched_at) VALUES(?,?,?,?,?,?,?)')
-    .run(pid, cid, 'submitted', ts(), b.recruiter || 'HR-Sandy', JSON.stringify(snap), snap.matched_at)
-  res.json({ ok: true, id: Number(r.lastInsertRowid) })
+  const out = tx(() => {
+    // 投递时同步固化当前评分证据；不创建重算批次，避免把单个投递伪装成批量策略重算
+    const m = upsertMatch(cid, pid, 0)
+    const stamp = now()
+    const snap = buildSnapshot(cid, pid, { ...m, computed_at: stamp }, {
+      stage: 'submitted',
+      stage_label: '投递',
+      event_type: 'advance',
+      matched_at: stamp,
+      recalc_job_id: 0
+    })
+    const r = db.prepare('INSERT INTO applications(position_id,candidate_id,stage,updated,recruiter,match_snapshot,matched_at) VALUES(?,?,?,?,?,?,?)')
+      .run(pid, cid, 'submitted', ts(), b.recruiter || 'HR-Sandy', JSON.stringify(snap), snap.matched_at)
+    const appId = Number(r.lastInsertRowid)
+    insertStageEvent({
+      applicationId: appId, stage: 'submitted', fromStage: '', eventType: 'advance',
+      operator: b.recruiter || 'HR-Sandy', candId: cid, posId: pid, latest: m
+    })
+    return { id: appId }
+  })
+  res.json({ ok: true, id: out.id })
 })
 
 app.post('/api/applications/:id/advance', (req, res) => {
   const id = num(req.params.id)
-  const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
-  if (!a) return res.status(404).json({ ok: false })
-  const next = NEXT_STAGE[a.stage]
-  if (!next) return res.json({ ok: false, msg: '已到最后阶段' })
-  db.prepare('UPDATE applications SET stage=?, updated=? WHERE id=?').run(next, ts(), id)
-  res.json({ ok: true })
+  const b = req.body || {}
+  const out = tx(() => {
+    const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
+    if (!a) return { notFound: true }
+    const next = NEXT_STAGE[a.stage]
+    if (!next) return { ok: false, msg: '已到最后阶段' }
+    const stamp = ts()
+    db.prepare('UPDATE applications SET stage=?, updated=? WHERE id=?').run(next, stamp, id)
+    // 推进时只固化当前最新分，不触发重算；这样该阶段证据不会与正在进行的重算互相覆盖
+    insertStageEvent({
+      applicationId: id, stage: next, fromStage: a.stage, eventType: 'advance',
+      operator: b.operator || a.recruiter || 'HR-Sandy', candId: a.candidate_id, posId: a.position_id
+    })
+    return { ok: true, stage: next }
+  })
+  if (out.notFound) return res.status(404).json({ ok: false })
+  res.json(out)
 })
 
 app.post('/api/applications/:id/reject', (req, res) => {
   const id = num(req.params.id)
-  db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(ts(), id)
-  res.json({ ok: true })
+  const b = req.body || {}
+  const out = tx(() => {
+    const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
+    if (!a) return { notFound: true }
+    const stamp = ts()
+    db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(stamp, id)
+    insertStageEvent({
+      applicationId: id, stage: 'rejected', fromStage: a.stage, eventType: 'reject',
+      operator: b.operator || a.recruiter || 'HR-Sandy', candId: a.candidate_id, posId: a.position_id
+    })
+    return { ok: true }
+  })
+  if (out.notFound) return res.status(404).json({ ok: false })
+  res.json(out)
 })
 
 // ---------------- 面试 ----------------
@@ -410,15 +615,34 @@ app.post('/api/applications/:id/offer', (req, res) => {
 
 app.post('/api/offers/:id', (req, res) => {
   const b = req.body || {}
-  const of = db.prepare('SELECT * FROM offers WHERE id=?').get(num(req.params.id))
-  if (!of) return res.status(404).json({ ok: false })
-  if (b.status) {
-    db.prepare('UPDATE offers SET status=? WHERE id=?').run(b.status, num(req.params.id))
-    // offer accepted → 流程推进到hired(可入职)
-    if (b.status === 'accepted') db.prepare("UPDATE applications SET stage='hired', updated=? WHERE id=?").run(ts(), of.application_id)
-    if (b.status === 'rejected') db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(ts(), of.application_id)
-  }
-  res.json({ ok: true })
+  const offerId = num(req.params.id)
+  const out = tx(() => {
+    const of = db.prepare('SELECT * FROM offers WHERE id=?').get(offerId)
+    if (!of) return { notFound: true }
+    if (b.status) {
+      db.prepare('UPDATE offers SET status=? WHERE id=?').run(b.status, offerId)
+      const a = db.prepare('SELECT * FROM applications WHERE id=?').get(of.application_id)
+      const stamp = ts()
+      // offer accepted/rejected 同步更新应用阶段并写阶段事件，避免只看到终态、缺少进入终态的评分依据
+      if (b.status === 'accepted' && a.stage !== 'hired') {
+        db.prepare("UPDATE applications SET stage='hired', updated=? WHERE id=?").run(stamp, a.id)
+        insertStageEvent({
+          applicationId: a.id, stage: 'hired', fromStage: a.stage, eventType: 'offer_accepted',
+          operator: b.operator || a.recruiter || 'HR-Sandy', candId: a.candidate_id, posId: a.position_id
+        })
+      }
+      if (b.status === 'rejected' && a.stage !== 'rejected') {
+        db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(stamp, a.id)
+        insertStageEvent({
+          applicationId: a.id, stage: 'rejected', fromStage: a.stage, eventType: 'offer_rejected',
+          operator: b.operator || a.recruiter || 'HR-Sandy', candId: a.candidate_id, posId: a.position_id
+        })
+      }
+    }
+    return { ok: true }
+  })
+  if (out.notFound) return res.status(404).json({ ok: false })
+  res.json(out)
 })
 
 // ---------------- 渠道 ----------------
@@ -428,30 +652,84 @@ app.post('/api/channels', (req, res) => {
   res.json({ ok: true })
 })
 
-// 启动时按各职位当前策略重算全部已落库匹配，刷新「最新结果」（不影响投递快照）
-function refreshAllMatches() {
-  const rows = db.prepare('SELECT candidate_id, position_id FROM matches').all()
-  rows.forEach(r => upsertMatch(r.candidate_id, r.position_id))
-  if (rows.length) console.log(`[HR] refreshed ${rows.length} stored matches`)
-}
+// 启动迁移：旧库中已有的 matches/applications 归入一个 startup 批次，并补齐投递快照与阶段事件
+function migrateHistory() {
+  const hadStartupJob = db.prepare("SELECT COUNT(*) c FROM recalc_jobs WHERE trigger_type='startup'").get().c > 0
+  const pairRows = db.prepare(`
+    SELECT candidate_id, position_id FROM matches
+    UNION SELECT candidate_id, position_id FROM applications
+  `).all()
+  const appsNeedBackfill = db.prepare(`
+    SELECT a.* FROM applications a
+    WHERE (a.match_snapshot IS NULL OR a.match_snapshot='')
+       OR NOT EXISTS (SELECT 1 FROM application_events e WHERE e.application_id=a.id)
+  `).all()
 
-// 兼容已有匹配记录：为升级前产生的投递记录回填评分快照（标记为迁移补录）
-function backfillSnapshots() {
-  const rows = db.prepare('SELECT id, candidate_id, position_id FROM applications WHERE match_snapshot IS NULL OR match_snapshot=?').all('')
-  let n = 0
-  rows.forEach(r => {
-    const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(r.candidate_id)
-    const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(r.position_id)
-    if (!cand || !pos) return
-    const m = upsertMatch(r.candidate_id, r.position_id)
-    const snap = { ...buildSnapshot(r.candidate_id, r.position_id, m), backfilled: true }
-    db.prepare('UPDATE applications SET match_snapshot=?, matched_at=? WHERE id=?')
-      .run(JSON.stringify(snap), snap.matched_at, r.id)
-    n++
+  if (!pairRows.length || (hadStartupJob && !appsNeedBackfill.length)) return
+
+  tx(() => {
+    let jobId = 0
+    const latestStartupJob = hadStartupJob
+      ? num(db.prepare("SELECT MAX(id) id FROM recalc_jobs WHERE trigger_type='startup'").get().id || 0)
+      : 0
+    if (pairRows.length && !hadStartupJob) {
+      jobId = createRecalcJob({ triggerType: 'startup', scope: 'startup', triggeredBy: 'system-migration' })
+      pairRows.forEach(r => upsertMatch(r.candidate_id, r.position_id, jobId))
+      completeRecalcJob(jobId, pairRows.length)
+    } else {
+      jobId = latestStartupJob
+    }
+
+    appsNeedBackfill.forEach(a => {
+      let snap = parseJSON(a.match_snapshot, null)
+      const latest = resultFromStored(getStoredMatch(a.candidate_id, a.position_id))
+      const item = latestJobForPair(a.candidate_id, a.position_id)
+      if (!snap) {
+        snap = buildSnapshot(a.candidate_id, a.position_id, latest || {
+          score: 0, dims: [], reason: '暂无已发布评分', weakness: '暂无评分依据'
+        }, {
+          stage: 'submitted', stage_label: '投递', event_type: 'advance',
+          recalc_job_id: item?.job_id || jobId, backfilled: true
+        })
+        db.prepare('UPDATE applications SET match_snapshot=?, matched_at=? WHERE id=?')
+          .run(JSON.stringify(snap), snap.matched_at, a.id)
+      }
+
+      const eventExists = stage => db.prepare('SELECT id FROM application_events WHERE application_id=? AND stage=?').get(a.id, stage)
+      const insertRawEvent = (stage, eventType, fromStage, payload) => {
+        const enriched = {
+          ...payload,
+          stage,
+          stage_label: { submitted: '投递', screening: '筛选', interview: '面试', offer: 'Offer', hired: '录用', rejected: '淘汰' }[stage] || stage,
+          event_type: eventType,
+          event_at: payload.event_at || payload.matched_at || ts(),
+          backfilled: true
+        }
+        db.prepare(`INSERT INTO application_events(application_id,stage,from_stage,event_type,event_at,operator,score_snapshot,match_score,strategy_id,recalc_job_id,backfilled)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(application_id,stage,event_type) DO NOTHING`)
+          .run(a.id, stage, fromStage, eventType, enriched.event_at, a.recruiter || 'system-migration',
+            JSON.stringify(enriched), num(enriched.score), num(enriched.strategy_id),
+            num(enriched.recalc_job_id || item?.job_id || jobId), 1)
+      }
+
+      if (!eventExists('submitted')) insertRawEvent('submitted', 'advance', '', snap)
+      if (a.stage !== 'submitted' && !eventExists(a.stage)) {
+        const order = ['submitted', 'screening', 'interview', 'offer', 'hired']
+        const currentIndex = order.indexOf(a.stage)
+        const fromStage = currentIndex > 0 ? order[currentIndex - 1] : 'submitted'
+        const eventType = a.stage === 'rejected' ? 'reject' : 'advance'
+        const stageSnap = buildSnapshot(a.candidate_id, a.position_id, latest || snap, {
+          recalc_job_id: item?.job_id || jobId
+        })
+        insertRawEvent(a.stage, eventType, a.stage === 'rejected' ? fromStage : fromStage, stageSnap)
+      }
+    })
+
+    if (jobId) console.log(`[HR] startup recalc job #${jobId} refreshed ${pairRows.length} pairs`)
+    if (appsNeedBackfill.length) console.log(`[HR] backfilled trace events for ${appsNeedBackfill.length} applications`)
   })
-  if (n) console.log(`[HR] backfilled match snapshots for ${n} legacy applications`)
 }
-refreshAllMatches()
-backfillSnapshots()
+migrateHistory()
 
 app.listen(PORT, () => console.log(`[HR] API running at http://localhost:${PORT}`))

@@ -22,6 +22,8 @@ export const useHrStore = defineStore('hr', {
     channels: s => s.data?.channels || [],
     matches: s => s.data?.matches || [],
     strategyVersions: s => s.data?.strategyVersions || [],
+    recalcJobs: s => s.data?.recalcJobs || [],
+    recalcItems: s => s.data?.recalcItems || [],
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open')
   },

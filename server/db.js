@@ -80,6 +80,56 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_versions_pos ON strategy_versions(position_id);
 
+-- 重算批次：把策略发布/手动重算/启动迁移与每一次批量评分关联起来
+CREATE TABLE IF NOT EXISTS recalc_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  trigger_type TEXT NOT NULL, -- strategy_publish/manual/startup
+  scope TEXT NOT NULL,        -- position/global/startup
+  position_id INTEGER NOT NULL DEFAULT 0,
+  strategy_id INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'completed',
+  pair_count INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  triggered_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_recalc_jobs_strategy ON recalc_jobs(strategy_id);
+
+-- 重算明细：不可变的批次评分结果，用于核对 matches 当前最新分由哪个批次/策略产生
+CREATE TABLE IF NOT EXISTS recalc_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL,
+  candidate_id INTEGER NOT NULL,
+  position_id INTEGER NOT NULL,
+  strategy_id INTEGER NOT NULL DEFAULT 0,
+  score INTEGER NOT NULL DEFAULT 0,
+  dims TEXT NOT NULL DEFAULT '[]',
+  reason TEXT NOT NULL DEFAULT '',
+  weakness TEXT NOT NULL DEFAULT '',
+  computed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_recalc_items_job ON recalc_items(job_id);
+CREATE INDEX IF NOT EXISTS idx_recalc_items_pair ON recalc_items(position_id, candidate_id, id);
+
+-- 流程事件：候选人每次进入阶段时固化当时评分，形成“策略版本→评分→阶段决策”的证据链
+CREATE TABLE IF NOT EXISTS application_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  from_stage TEXT NOT NULL DEFAULT '',
+  event_type TEXT NOT NULL DEFAULT 'advance',
+  event_at TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '',
+  score_snapshot TEXT NOT NULL DEFAULT '',
+  match_score INTEGER NOT NULL DEFAULT 0,
+  strategy_id INTEGER NOT NULL DEFAULT 0,
+  recalc_job_id INTEGER NOT NULL DEFAULT 0,
+  backfilled INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_app_events_once
+  ON application_events(application_id, stage, event_type);
+CREATE INDEX IF NOT EXISTS idx_app_events_app ON application_events(application_id, id);
+
 CREATE TABLE IF NOT EXISTS interviews (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   application_id INTEGER NOT NULL,
