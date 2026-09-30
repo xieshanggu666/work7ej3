@@ -7,6 +7,7 @@ const db = new DatabaseSync(join(__dirname, 'hr.db'))
 
 db.exec(`
 PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000; -- 重算事务与流程推进并发时等待写锁，避免 SQLITE_BUSY
 
 CREATE TABLE IF NOT EXISTS positions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +80,32 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
   published_by TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_versions_pos ON strategy_versions(position_id);
+
+-- 阶段进入留痕（可追溯链路核心）：候选人每次「进入某阶段」时固化当时的评分依据。
+-- 与 applications.match_snapshot 的区别：快照只记录投递瞬间；此表对每个阶段各留一条，
+-- 之后策略发布/批量重算只刷新 matches 最新结果，已固化事件永不改变。
+CREATE TABLE IF NOT EXISTS stage_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  position_id INTEGER NOT NULL,
+  candidate_id INTEGER NOT NULL,
+  stage TEXT NOT NULL,                       -- submitted/screening/interview/offer/hired/rejected
+  from_stage TEXT NOT NULL DEFAULT '',       -- 上一阶段（首条 submitted 为空）
+  score INTEGER NOT NULL DEFAULT 0,          -- 进入该阶段时锁定的分数
+  dims TEXT NOT NULL DEFAULT '[]',           -- 五维得分与当时权重
+  reason TEXT NOT NULL DEFAULT '',
+  weakness TEXT NOT NULL DEFAULT '',
+  weights TEXT NOT NULL DEFAULT '{}',        -- 评分所用策略权重（留痕）
+  keyword_cap INTEGER NOT NULL DEFAULT 5,
+  strategy_id INTEGER NOT NULL DEFAULT 0,    -- 评分依据的策略版本号（0=系统默认）
+  strategy_is_default INTEGER NOT NULL DEFAULT 1,
+  basis TEXT NOT NULL DEFAULT 'latest',      -- latest=按当时最新结果固化；snapshot=沿用投递快照；legacy=补录
+  backfilled INTEGER NOT NULL DEFAULT 0,     -- 1=启动迁移时为旧数据补录
+  created TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_stage_events_app ON stage_events(application_id, id);
+CREATE INDEX IF NOT EXISTS idx_stage_events_strategy ON stage_events(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_stage_events_pair ON stage_events(position_id, candidate_id);
 
 CREATE TABLE IF NOT EXISTS interviews (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

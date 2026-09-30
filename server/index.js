@@ -157,14 +157,54 @@ function upsertMatch(candId, posId) {
 }
 
 // 投递时的评分依据快照：锁定分数/维度/理由/短板及所用策略，后续重算不再改变
-function buildSnapshot(candId, posId, m) {
-  const strategy = getStrategy(posId)
+function buildSnapshot(m) {
   return {
     score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness,
-    weights: strategy.weights, keyword_cap: strategy.keywordCap,
-    strategy_id: strategy.versionId, strategy_is_default: strategy.isDefault,
+    weights: m.weights, keyword_cap: m.keyword_cap,
+    strategy_id: m.strategy_id, strategy_is_default: m.strategy_is_default,
     matched_at: now()
   }
+}
+
+// ---------------- 可追溯链路：事务 + 阶段进入留痕 ----------------
+// 所有「写最新结果 / 固化阶段依据 / 推进流程」的组合操作都在一个立即事务里完成，
+// 避免批量重算与流程推进交叉时出现「阶段已推进、评分依据还是旧策略」的不一致。
+function tx(fn) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const r = fn()
+    db.exec('COMMIT')
+    return r
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+}
+
+// 从 upsertMatch 的返回值提取需要留痕的评分依据
+function evidenceOf(m) {
+  return {
+    score: m.score, dims: m.dims, reason: m.reason, weakness: m.weakness,
+    weights: m.weights, keyword_cap: m.keyword_cap,
+    strategy_id: m.strategy_id, strategy_is_default: m.strategy_is_default
+  }
+}
+
+// 候选人进入某阶段时固化一条评分依据；同一阶段只保留首次进入的一条（幂等）
+function insertStageEvent({ appId, posId, candId, stage, fromStage, ev, basis = 'latest', backfilled = 0, created }) {
+  const dup = db.prepare('SELECT id FROM stage_events WHERE application_id=? AND stage=?').get(appId, stage)
+  if (dup) return null
+  const stamp = created || ts()
+  const r = db.prepare(`INSERT INTO stage_events
+    (application_id,position_id,candidate_id,stage,from_stage,score,dims,reason,weakness,weights,keyword_cap,strategy_id,strategy_is_default,basis,backfilled,created)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    appId, posId, candId, stage, fromStage || '',
+    num(ev.score), JSON.stringify(ev.dims || []), ev.reason || '', ev.weakness || '',
+    JSON.stringify(ev.weights || {}), num(ev.keyword_cap, DEFAULT_KEYWORD_CAP),
+    num(ev.strategy_id), ev.strategy_is_default === false ? 0 : 1,
+    basis, backfilled ? 1 : 0, stamp
+  )
+  return Number(r.lastInsertRowid)
 }
 
 // ---------------- 状态汇总 ----------------
@@ -187,6 +227,18 @@ app.get('/api/state', (req, res) => {
     dims: parseDims(m.dims, '[]'),
     strategy_id: num(m.strategy_id)
   }))
+  // 阶段进入留痕：按应聘记录聚合，供看板按阶段/按策略版本回看评分依据
+  const stageEvents = db.prepare('SELECT * FROM stage_events ORDER BY id ASC').all().map(e => ({
+    ...e,
+    score: num(e.score),
+    dims: parseDims(e.dims, '[]'),
+    weights: parseJSON(e.weights, { ...DEFAULT_WEIGHTS }),
+    keyword_cap: num(e.keyword_cap),
+    strategy_id: num(e.strategy_id),
+    strategy_is_default: !!e.strategy_is_default,
+    backfilled: !!e.backfilled
+  }))
+  const eventsOfApp = appId => stageEvents.filter(e => e.application_id === appId)
   const matchOf = (cid, pid) => matches.find(m => m.candidate_id === cid && m.position_id === pid) || null
   const pipelines = apps.map(a => {
     const pos = positions.find(p => p.id === a.position_id)
@@ -206,6 +258,7 @@ app.get('/api/state', (req, res) => {
       candidate: cand ? cand.name : '', candSkills: cand ? cand.skills : [],
       matchSnapshot: snap, matched_at: a.matched_at || '',
       match: latest,
+      stageEvents: eventsOfApp(a.id),
       interviews: its, offer: of
     }
   })
@@ -264,16 +317,20 @@ app.post('/api/positions/:id/strategy', (req, res) => {
     weights = normalizeWeights(b.weights || {})
     keywordCap = Math.max(0, Math.min(20, num(b.keyword_cap, DEFAULT_KEYWORD_CAP)))
   }
-  const vr = db.prepare('INSERT INTO strategy_versions(position_id,weights,keyword_cap,published_at,published_by) VALUES(?,?,?,?,?)')
-    .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
-  const versionId = Number(vr.lastInsertRowid)
-  db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,published_at,published_by)
-              VALUES(?,?,?,?,?)
-              ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,published_at=excluded.published_at,published_by=excluded.published_by`)
-    .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
-  // 发布后按新策略批量重算该职位的全部推荐结果（默认开启）
-  let recalced = 0
-  if (b.recalc !== false) recalced = recomputePosition(id)
+  // 版本留痕 → 生效配置 → 按新策略重算该职位全部推荐，单事务提交；
+  // 期间该职位上的流程推进请求会在写锁处等待，不会读到「半发布」状态。
+  let recalced = 0, versionId = 0
+  tx(() => {
+    const vr = db.prepare('INSERT INTO strategy_versions(position_id,weights,keyword_cap,published_at,published_by) VALUES(?,?,?,?,?)')
+      .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
+    versionId = Number(vr.lastInsertRowid)
+    db.prepare(`INSERT INTO match_strategies(position_id,weights,keyword_cap,published_at,published_by)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(position_id) DO UPDATE SET weights=excluded.weights,keyword_cap=excluded.keyword_cap,published_at=excluded.published_at,published_by=excluded.published_by`)
+      .run(id, JSON.stringify(weights), keywordCap, stamp, b.published_by || 'HR')
+    // 发布后按新策略批量重算该职位的全部推荐结果（默认开启）；只动 matches，不触碰已固化快照/阶段事件
+    if (b.recalc !== false) recalced = recomputePosition(id)
+  })
   res.json({ ok: true, strategy: { weights, keywordCap, versionId, publishedAt: stamp }, recalced })
 })
 
@@ -289,19 +346,25 @@ function recomputePosition(posId) {
 
 app.post('/api/match/recompute', (req, res) => {
   const b = req.body || {}
-  let pairCount = 0, posCount = 0
   if (b.position_id) {
     const pos = db.prepare('SELECT id FROM positions WHERE id=?').get(num(b.position_id))
     if (!pos) return res.status(404).json({ ok: false })
-    pairCount = recomputePosition(num(b.position_id))
-    posCount = 1
-  } else {
-    // 全局：所有在招职位 × 全部候选人；同时补上已关闭职位上已存在的匹配对
-    const open = db.prepare("SELECT id FROM positions WHERE status='open'").all()
-    open.forEach(p => { pairCount += recomputePosition(p.id); posCount++ })
-    db.prepare("SELECT DISTINCT m.position_id FROM matches m JOIN positions p ON p.id=m.position_id WHERE p.status!='open'")
-      .all().forEach(r => { pairCount += recomputePosition(r.position_id); posCount++ })
   }
+  let pairCount = 0, posCount = 0
+  // 整批刷新在同一事务内：要么全部 matches 刷新成功，要么整体回滚；
+  // 流程推进事务在写锁处排队，重算提交后它拿到的一定是最新策略结果。
+  tx(() => {
+    if (b.position_id) {
+      pairCount = recomputePosition(num(b.position_id))
+      posCount = 1
+    } else {
+      // 全局：所有在招职位 × 全部候选人；同时补上已关闭职位上已存在的匹配对
+      const open = db.prepare("SELECT id FROM positions WHERE status='open'").all()
+      open.forEach(p => { pairCount += recomputePosition(p.id); posCount++ })
+      db.prepare("SELECT DISTINCT m.position_id FROM matches m JOIN positions p ON p.id=m.position_id WHERE p.status!='open'")
+        .all().forEach(r => { pairCount += recomputePosition(r.position_id); posCount++ })
+    }
+  })
   res.json({ ok: true, positions: posCount, pairs: pairCount, recomputed_at: ts() })
 })
 
@@ -357,12 +420,21 @@ app.post('/api/applications', (req, res) => {
   const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(cid)
   const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(pid)
   if (!cand || !pos) return res.status(404).json({ ok: false, msg: '职位或候选人不存在' })
-  // 先按职位策略重算最新结果，再把当前评分依据固化为投递快照（历史评分不再随后续重算改变）
-  const m = upsertMatch(cid, pid)
-  const snap = buildSnapshot(cid, pid, m)
-  const r = db.prepare('INSERT INTO applications(position_id,candidate_id,stage,updated,recruiter,match_snapshot,matched_at) VALUES(?,?,?,?,?,?,?)')
-    .run(pid, cid, 'submitted', ts(), b.recruiter || 'HR-Sandy', JSON.stringify(snap), snap.matched_at)
-  res.json({ ok: true, id: Number(r.lastInsertRowid) })
+  // 单事务：按职位策略重算最新结果 → 固化投递快照 → 写入「投递」阶段留痕 → 建单，四者原子提交
+  const stamp = ts()
+  const id = tx(() => {
+    const m = upsertMatch(cid, pid)
+    const snap = buildSnapshot(m)
+    const r = db.prepare('INSERT INTO applications(position_id,candidate_id,stage,updated,recruiter,match_snapshot,matched_at) VALUES(?,?,?,?,?,?,?)')
+      .run(pid, cid, 'submitted', stamp, b.recruiter || 'HR-Sandy', JSON.stringify(snap), snap.matched_at)
+    const appId = Number(r.lastInsertRowid)
+    insertStageEvent({
+      appId, posId: pid, candId: cid, stage: 'submitted', fromStage: '',
+      ev: evidenceOf(m), basis: 'snapshot'
+    })
+    return appId
+  })
+  res.json({ ok: true, id })
 })
 
 app.post('/api/applications/:id/advance', (req, res) => {
@@ -371,13 +443,34 @@ app.post('/api/applications/:id/advance', (req, res) => {
   if (!a) return res.status(404).json({ ok: false })
   const next = NEXT_STAGE[a.stage]
   if (!next) return res.json({ ok: false, msg: '已到最后阶段' })
-  db.prepare('UPDATE applications SET stage=?, updated=? WHERE id=?').run(next, ts(), id)
-  res.json({ ok: true })
+  // 单事务保证一致性：先按当前策略刷新最新结果，再把「进入下一阶段时」的评分依据留痕，最后推进阶段。
+  // 与批量重算并发时，事务行锁/写锁会把两者串行化，杜绝阶段与依据错配。
+  let eventId = null, evidence = null
+  tx(() => {
+    const m = upsertMatch(a.candidate_id, a.position_id)
+    evidence = evidenceOf(m)
+    eventId = insertStageEvent({
+      appId: id, posId: a.position_id, candId: a.candidate_id,
+      stage: next, fromStage: a.stage, ev: evidence, basis: 'latest'
+    })
+    db.prepare('UPDATE applications SET stage=?, updated=? WHERE id=?').run(next, ts(), id)
+  })
+  res.json({ ok: true, stage: next, eventId, evidence })
 })
 
 app.post('/api/applications/:id/reject', (req, res) => {
   const id = num(req.params.id)
-  db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(ts(), id)
+  const a = db.prepare('SELECT * FROM applications WHERE id=?').get(id)
+  if (!a) return res.status(404).json({ ok: false })
+  // 淘汰同样留痕：固化淘汰时刻的最新评分依据，便于事后复盘「为什么在该阶段淘汰」
+  tx(() => {
+    const m = upsertMatch(a.candidate_id, a.position_id)
+    insertStageEvent({
+      appId: id, posId: a.position_id, candId: a.candidate_id,
+      stage: 'rejected', fromStage: a.stage, ev: evidenceOf(m), basis: 'latest'
+    })
+    db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(ts(), id)
+  })
   res.json({ ok: true })
 })
 
@@ -413,10 +506,22 @@ app.post('/api/offers/:id', (req, res) => {
   const of = db.prepare('SELECT * FROM offers WHERE id=?').get(num(req.params.id))
   if (!of) return res.status(404).json({ ok: false })
   if (b.status) {
-    db.prepare('UPDATE offers SET status=? WHERE id=?').run(b.status, num(req.params.id))
-    // offer accepted → 流程推进到hired(可入职)
-    if (b.status === 'accepted') db.prepare("UPDATE applications SET stage='hired', updated=? WHERE id=?").run(ts(), of.application_id)
-    if (b.status === 'rejected') db.prepare("UPDATE applications SET stage='rejected', updated=? WHERE id=?").run(ts(), of.application_id)
+    // Offer 接受/拒绝会驱动流程跳变到 hired/rejected，与阶段推进走同一套「留痕+推进」事务
+    tx(() => {
+      db.prepare('UPDATE offers SET status=? WHERE id=?').run(b.status, num(req.params.id))
+      if (b.status === 'accepted' || b.status === 'rejected') {
+        const a = db.prepare('SELECT * FROM applications WHERE id=?').get(of.application_id)
+        const target = b.status === 'accepted' ? 'hired' : 'rejected'
+        if (a && a.stage !== target) {
+          const m = upsertMatch(a.candidate_id, a.position_id)
+          insertStageEvent({
+            appId: a.id, posId: a.position_id, candId: a.candidate_id,
+            stage: target, fromStage: a.stage, ev: evidenceOf(m), basis: 'latest'
+          })
+          db.prepare('UPDATE applications SET stage=?, updated=? WHERE id=?').run(target, ts(), a.id)
+        }
+      }
+    })
   }
   res.json({ ok: true })
 })
@@ -444,14 +549,56 @@ function backfillSnapshots() {
     const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(r.position_id)
     if (!cand || !pos) return
     const m = upsertMatch(r.candidate_id, r.position_id)
-    const snap = { ...buildSnapshot(r.candidate_id, r.position_id, m), backfilled: true }
+    const snap = { ...buildSnapshot(m), backfilled: true }
     db.prepare('UPDATE applications SET match_snapshot=?, matched_at=? WHERE id=?')
       .run(JSON.stringify(snap), snap.matched_at, r.id)
     n++
   })
   if (n) console.log(`[HR] backfilled match snapshots for ${n} legacy applications`)
 }
+
+// 为升级前的应聘记录补录阶段进入留痕：
+// submitted 沿用投递快照依据；当前所处阶段按当前最新结果补一条（均标记 backfilled）。
+// 幂等：已有 stage_events 的应聘记录跳过。
+const PREV_STAGE = { rejected: 'offer', hired: 'offer', offer: 'interview', interview: 'screening', screening: 'submitted' }
+function backfillStageEvents() {
+  const apps = db.prepare('SELECT * FROM applications ORDER BY id').all()
+  let n = 0
+  tx(() => {
+    apps.forEach(a => {
+      const existed = db.prepare('SELECT COUNT(*) c FROM stage_events WHERE application_id=?').get(a.id).c
+      if (existed > 0) return
+      const cand = db.prepare('SELECT * FROM candidates WHERE id=?').get(a.candidate_id)
+      const pos = db.prepare('SELECT * FROM positions WHERE id=?').get(a.position_id)
+      if (!cand || !pos) return
+      const snap = parseJSON(a.match_snapshot, null)
+      const createdBase = a.updated || ts()
+      // 1) 投递阶段：优先沿用投递快照，保证与看板「投递时评分」完全一致
+      if (snap) {
+        insertStageEvent({
+          appId: a.id, posId: a.position_id, candId: a.candidate_id,
+          stage: 'submitted', fromStage: '', ev: snap, basis: 'snapshot',
+          backfilled: true, created: createdBase
+        })
+        n++
+      }
+      // 2) 当前阶段（非 submitted）：补录一条基于当前最新结果的留痕
+      if (a.stage && a.stage !== 'submitted') {
+        const m = upsertMatch(a.candidate_id, a.position_id)
+        insertStageEvent({
+          appId: a.id, posId: a.position_id, candId: a.candidate_id,
+          stage: a.stage, fromStage: PREV_STAGE[a.stage] || 'submitted',
+          ev: evidenceOf(m), basis: 'legacy',
+          backfilled: true, created: createdBase
+        })
+        n++
+      }
+    })
+  })
+  if (n) console.log(`[HR] backfilled ${n} stage events for legacy applications`)
+}
 refreshAllMatches()
 backfillSnapshots()
+backfillStageEvents()
 
 app.listen(PORT, () => console.log(`[HR] API running at http://localhost:${PORT}`))
